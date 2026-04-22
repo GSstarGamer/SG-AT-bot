@@ -4,3 +4,4 @@ __pycache__/
 venv/
 *.pyc
 guild_config.json
+guild_config_test.json

@@ -5,12 +5,14 @@ import logging
 import os
 from pathlib import Path
 import re
+import sys
+import time
 from typing import Any
 
 import aiohttp
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from roblox_api import RobloxAPIError, RobloxClient, RobloxUser
@@ -21,7 +23,11 @@ load_dotenv()
 EMBED_COLOR = discord.Color.from_rgb(128, 0, 255)
 ALLY_EMBED_COLOR = discord.Color.from_rgb(57, 255, 20)
 TEAMER_EMBED_COLOR = discord.Color.red()
-CONFIG_PATH = Path("guild_config.json")
+STAFF_OVERRIDE_ROLE_ID = 1496291137265078364
+TEST_MODE = "--testing" in sys.argv
+CONFIG_PATH = Path("guild_config_test.json" if TEST_MODE else "guild_config.json")
+AUTO_CLOSE_TRIGGER_SECONDS = 3600
+AUTO_CLOSE_RESPONSE_SECONDS = 60
 
 
 logging.basicConfig(
@@ -40,7 +46,35 @@ def load_guild_config() -> dict[str, dict[str, Any]]:
         data = json.load(file)
 
     if isinstance(data, dict):
-        return data
+        normalized: dict[str, dict[str, Any]] = {}
+        for guild_id, guild_state in data.items():
+            if not isinstance(guild_id, str):
+                continue
+
+            if not isinstance(guild_state, dict):
+                guild_state = {}
+
+            guild_state.setdefault("reporter_ids", {})
+            guild_state.setdefault("reporter_usernames", {})
+            guild_state.setdefault("report_results", {})
+            guild_state.setdefault("report_notification_messages", {})
+            guild_state.setdefault("auto_close_prompts", {})
+            guild_state.setdefault("ally_user_ids", {})
+            guild_state.setdefault("ally_usernames", {})
+            guild_state.setdefault("removed_rep_user_ids", {})
+            guild_state.setdefault("user_memory", {})
+
+            user_memory = guild_state.get("user_memory", {})
+            if isinstance(user_memory, dict):
+                for discord_user_id in list(user_memory.keys()):
+                    try:
+                        get_user_memory_record(guild_state, int(discord_user_id))
+                    except ValueError:
+                        continue
+
+            normalized[guild_id] = guild_state
+
+        return normalized
     return {}
 
 
@@ -54,6 +88,9 @@ def get_guild_state(bot: "ATBot", guild_id: int) -> dict[str, Any]:
     state.setdefault("reporter_ids", {})
     state.setdefault("reporter_usernames", {})
     state.setdefault("report_results", {})
+    state.setdefault("report_notification_messages", {})
+    state.setdefault("auto_close_prompts", {})
+    state.setdefault("ally_user_ids", {})
     state.setdefault("ally_usernames", {})
     state.setdefault("removed_rep_user_ids", {})
     state.setdefault("user_memory", {})
@@ -66,6 +103,8 @@ def get_user_memory_record(guild_state: dict[str, Any], discord_user_id: int) ->
 
     if isinstance(entry, dict):
         entry.setdefault("rep", 0)
+        entry.setdefault("wins", 0)
+        entry.setdefault("losses", 0)
         guild_state["user_memory"][key] = entry
         return entry
 
@@ -74,11 +113,13 @@ def get_user_memory_record(guild_state: dict[str, Any], discord_user_id: int) ->
             "value": entry,
             "username": entry,
             "rep": 0,
+            "wins": 0,
+            "losses": 0,
         }
         guild_state["user_memory"][key] = upgraded
         return upgraded
 
-    created = {"rep": 0}
+    created = {"rep": 0, "wins": 0, "losses": 0}
     guild_state["user_memory"][key] = created
     return created
 
@@ -103,16 +144,107 @@ def set_saved_user_entry(
     entry["username"] = roblox_user.username
 
 
+def find_linked_discord_user_id(
+    guild_state: dict[str, Any],
+    roblox_user: RobloxUser,
+) -> int | None:
+    user_memory = guild_state.get("user_memory", {})
+    if not isinstance(user_memory, dict):
+        return None
+
+    for discord_user_id, entry in user_memory.items():
+        if not isinstance(entry, dict):
+            continue
+
+        linked_value = entry.get("value")
+        if linked_value == roblox_user.profile_url:
+            try:
+                return int(discord_user_id)
+            except ValueError:
+                return None
+
+    return None
+
+
+def ensure_user_link_available(
+    guild_state: dict[str, Any],
+    discord_user_id: int,
+    roblox_user: RobloxUser,
+) -> None:
+    linked_discord_user_id = find_linked_discord_user_id(guild_state, roblox_user)
+    if linked_discord_user_id is None or linked_discord_user_id == discord_user_id:
+        return
+
+    raise ValueError(
+        f"The Roblox account `{roblox_user.username}` is already linked to another Discord user."
+    )
+
+
 def build_panel_embed(forum_channel_mention: str) -> discord.Embed:
     return discord.Embed(
-        title="AT report",
+        title="Teamer report",
         description=(
-            "create a report if being your being teamed on. "
-            "Everyone under AT squad will be pinged. "
-            f"This report will go into {forum_channel_mention}"
+            "Use this panel to quickly open a teaming report, bring in help, and keep "
+            "everything organized in one place. When a report is created, the configured "
+            f"team role will be pinged and the post will go into {forum_channel_mention}."
         ),
         color=EMBED_COLOR,
     )
+
+
+def build_panel_commands_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="How To Use It",
+        description="Public tools available after a report is created:",
+        color=EMBED_COLOR,
+    )
+    embed.add_field(
+        name="Create Teaming Report",
+        value="Open a new report and list the teamers you are fighting.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Add yourself",
+        value="Join a report as a helper. Your saved Roblox user will be used if you already set one.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Add teamer",
+        value="Add more teamers to the report from inside the post.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Join user",
+        value="Open the reporter's Roblox link so you can get to them faster.",
+        inline=False,
+    )
+    embed.add_field(
+        name="Close post",
+        value="Reporter only. Ends the report and records the outcome of the fight.",
+        inline=False,
+    )
+    embed.add_field(
+        name="/removerep",
+        value="Reporter only. Remove an unhelpful ally from the report and take away 1 rep.",
+        inline=False,
+    )
+    embed.add_field(
+        name="/setuser",
+        value="Save your Roblox account so you do not have to type it every time.",
+        inline=False,
+    )
+    embed.add_field(
+        name="/leaderboard",
+        value="View the current helper leaderboard for the server.",
+        inline=False,
+    )
+    return embed
+
+
+def build_panel_image_embed() -> discord.Embed:
+    embed = discord.Embed(color=EMBED_COLOR)
+    embed.set_image(url="attachment://ATpfp.png")
+    return embed
 
 
 def build_report_embeds(
@@ -172,6 +304,85 @@ def build_report_thread_title(
     teamers: list[RobloxUser],
 ) -> str:
     return f"{1 + len(allies)}v{len(teamers)} from {reporter.display_name}"[:100]
+
+
+def build_report_count_title(
+    allies: list[RobloxUser],
+    teamers: list[RobloxUser],
+) -> str:
+    return f"{1 + len(allies)}v{len(teamers)}"
+
+
+def build_report_notification_embed(
+    title: str,
+    thread: discord.Thread,
+) -> discord.Embed:
+    return discord.Embed(
+        title=title,
+        color=EMBED_COLOR,
+        timestamp=thread.created_at,
+    )
+
+
+def extract_thread_id_from_notification_message(
+    guild_state: dict[str, Any],
+    message: discord.Message | None,
+) -> int | None:
+    if message is None:
+        return None
+
+    notification_messages = guild_state.get("report_notification_messages", {})
+    if not isinstance(notification_messages, dict):
+        return None
+
+    for thread_id_text, entry in notification_messages.items():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("message_id") == message.id:
+            if thread_id_text.isdigit():
+                return int(thread_id_text)
+            return None
+
+    return None
+
+
+def compute_status_messages(config: dict[str, dict[str, Any]]) -> list[str]:
+    total_wins = 0
+    total_losses = 0
+    active_helpers = 0
+
+    for guild_state in config.values():
+        if not isinstance(guild_state, dict):
+            continue
+
+        user_memory = guild_state.get("user_memory", {})
+        if not isinstance(user_memory, dict):
+            continue
+
+        for user_record in user_memory.values():
+            if not isinstance(user_record, dict):
+                continue
+
+            wins = user_record.get("wins", 0)
+            losses = user_record.get("losses", 0)
+            rep = user_record.get("rep", 0)
+
+            if isinstance(wins, int):
+                total_wins += wins
+            if isinstance(losses, int):
+                total_losses += losses
+            if isinstance(rep, int) and rep > 1:
+                active_helpers += 1
+
+    total_fights = total_wins + total_losses
+    winrate = 0.0 if total_fights == 0 else (total_wins / total_fights) * 100
+
+    return [
+        f"Won {total_wins} times against teamers",
+        f"{winrate:.1f}% Winrate",
+        f"{active_helpers} Active helpers",
+        "My dad is GS :P",
+    ]
 
 
 def get_report_identity(
@@ -234,6 +445,18 @@ def has_setup_permissions(member: discord.Member) -> bool:
     )
 
 
+def has_staff_override(member: discord.Member) -> bool:
+    return any(role.id == STAFF_OVERRIDE_ROLE_ID for role in member.roles)
+
+
+def can_manage_report(member: discord.Member, reporter_discord_id: int) -> bool:
+    return (
+        member.id == reporter_discord_id
+        or has_staff_override(member)
+        or member.guild_permissions.manage_threads
+    )
+
+
 def extract_first_url(text: str | None) -> str | None:
     if not text:
         return None
@@ -270,6 +493,178 @@ async def parse_report_message(
             teamers.append(player)
 
     return reporter, allies, teamers
+
+
+async def get_thread_by_id(
+    guild: discord.Guild,
+    thread_id: int,
+) -> discord.Thread | None:
+    thread = guild.get_thread(thread_id)
+    if thread is not None:
+        return thread
+
+    channel = guild.get_channel(thread_id)
+    if isinstance(channel, discord.Thread):
+        return channel
+
+    try:
+        fetched_channel = await guild.fetch_channel(thread_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+    if isinstance(fetched_channel, discord.Thread):
+        return fetched_channel
+    return None
+
+
+async def sync_report_notification(
+    bot: "ATBot",
+    thread: discord.Thread,
+    title: str,
+) -> None:
+    guild_state = get_guild_state(bot, thread.guild.id)
+    notification_entry = guild_state.setdefault("report_notification_messages", {}).get(
+        str(thread.id)
+    )
+    if not isinstance(notification_entry, dict):
+        return
+
+    channel_id = notification_entry.get("channel_id")
+    message_id = notification_entry.get("message_id")
+    if not isinstance(channel_id, int) or not isinstance(message_id, int):
+        return
+
+    channel = thread.guild.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        message = await channel.fetch_message(message_id)
+        await message.edit(
+            embed=build_report_notification_embed(title, thread),
+            view=NotificationActionView(),
+        )
+    except discord.NotFound:
+        guild_state["report_notification_messages"].pop(str(thread.id), None)
+        save_guild_config(bot.guild_config)
+    except discord.Forbidden:
+        return
+
+
+async def delete_report_notification(
+    bot: "ATBot",
+    thread: discord.Thread,
+) -> None:
+    guild_state = get_guild_state(bot, thread.guild.id)
+    notification_entry = guild_state.setdefault("report_notification_messages", {}).pop(
+        str(thread.id),
+        None,
+    )
+    save_guild_config(bot.guild_config)
+
+    if not isinstance(notification_entry, dict):
+        return
+
+    channel_id = notification_entry.get("channel_id")
+    message_id = notification_entry.get("message_id")
+    if not isinstance(channel_id, int) or not isinstance(message_id, int):
+        return
+
+    channel = thread.guild.get_channel(channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        return
+
+    try:
+        message = await channel.fetch_message(message_id)
+        await message.delete()
+    except (discord.NotFound, discord.Forbidden):
+        return
+
+
+async def announce_report_notification(
+    bot: "ATBot",
+    thread: discord.Thread,
+    reporter_discord_id: int,
+    mention_role_id: int,
+    notifications_channel_id: int,
+    title: str,
+) -> None:
+    notifications_channel = thread.guild.get_channel(notifications_channel_id)
+    if not isinstance(notifications_channel, discord.TextChannel):
+        return
+
+    message = await notifications_channel.send(
+        content=f"<@&{mention_role_id}>, <@{reporter_discord_id}> needs help.",
+        embed=build_report_notification_embed(title, thread),
+        view=NotificationActionView(),
+        allowed_mentions=discord.AllowedMentions(roles=True, users=True),
+    )
+
+    guild_state = get_guild_state(bot, thread.guild.id)
+    guild_state.setdefault("report_notification_messages", {})[str(thread.id)] = {
+        "channel_id": notifications_channel.id,
+        "message_id": message.id,
+    }
+    save_guild_config(bot.guild_config)
+
+
+async def bump_report_notification(
+    bot: "ATBot",
+    thread: discord.Thread,
+) -> None:
+    guild_state = get_guild_state(bot, thread.guild.id)
+    reporter_discord_id = guild_state["reporter_ids"].get(str(thread.id))
+    mention_role_id = guild_state.get("mention_role_id")
+    report_channel_id = guild_state.get("report_channel_id")
+
+    if not isinstance(reporter_discord_id, int):
+        raise ValueError("This report does not have a reporter linked to it.")
+    if not isinstance(mention_role_id, int):
+        raise ValueError("No mention role is configured for this server.")
+    if not isinstance(report_channel_id, int):
+        raise ValueError("No report channel is configured for this server.")
+
+    report_message = await get_report_message(thread)
+    reporter, allies, teamers = await parse_report_message(bot, report_message)
+    count_title = build_report_count_title(allies, teamers)
+
+    await delete_report_notification(bot, thread)
+    await announce_report_notification(
+        bot,
+        thread,
+        reporter_discord_id,
+        mention_role_id,
+        report_channel_id,
+        count_title,
+    )
+
+
+async def send_reporter_prompt(
+    bot: "ATBot",
+    thread: discord.Thread,
+) -> None:
+    guild_state = get_guild_state(bot, thread.guild.id)
+    reporter_discord_id = guild_state["reporter_ids"].get(str(thread.id))
+    if not isinstance(reporter_discord_id, int):
+        return
+
+    member = thread.guild.get_member(reporter_discord_id)
+    if member is None:
+        try:
+            member = await thread.guild.fetch_member(reporter_discord_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+
+    await member.send(
+        "Has the fight ended? If you do not respond within 1 minute, your post will be deleted.",
+        view=AutoClosePromptView(thread.guild.id, thread.id, reporter_discord_id),
+    )
+
+    guild_state.setdefault("auto_close_prompts", {})[str(thread.id)] = {
+        "reporter_id": reporter_discord_id,
+        "expires_at": time.time() + AUTO_CLOSE_RESPONSE_SECONDS,
+    }
+    save_guild_config(bot.guild_config)
 
 
 async def append_teamers_to_report(
@@ -311,7 +706,13 @@ async def append_teamers_to_report(
         embeds=updated_embeds[:10],
         view=ReportActionView(reporter.join_url),
     )
-    await thread.edit(name=build_report_thread_title(reporter, allies, existing_teamers))
+    new_title = build_report_thread_title(reporter, allies, existing_teamers)
+    await thread.edit(name=new_title)
+    await sync_report_notification(
+        bot,
+        thread,
+        build_report_count_title(allies, existing_teamers),
+    )
 
     return reporter, allies, existing_teamers, added_teamers
 
@@ -383,7 +784,13 @@ async def append_allies_to_report(
         embeds=updated_embeds[:10],
         view=ReportActionView(reporter.join_url),
     )
-    await thread.edit(name=build_report_thread_title(reporter, existing_allies, teamers))
+    new_title = build_report_thread_title(reporter, existing_allies, teamers)
+    await thread.edit(name=new_title)
+    await sync_report_notification(
+        bot,
+        thread,
+        build_report_count_title(existing_allies, teamers),
+    )
 
     return reporter, existing_allies, teamers, added_allies
 
@@ -443,7 +850,13 @@ async def remove_ally_from_report(
         embeds=updated_embeds[:10],
         view=ReportActionView(reporter.join_url),
     )
-    await thread.edit(name=build_report_thread_title(reporter, existing_allies, teamers))
+    new_title = build_report_thread_title(reporter, existing_allies, teamers)
+    await thread.edit(name=new_title)
+    await sync_report_notification(
+        bot,
+        thread,
+        build_report_count_title(existing_allies, teamers),
+    )
 
     member = thread.guild.get_member(ally_discord_id)
     if member is None:
@@ -579,6 +992,7 @@ async def resolve_report(
     reporter_ids = guild_state["reporter_ids"]
     ally_user_ids_map = guild_state.setdefault("ally_user_ids", {})
     report_results = guild_state["report_results"]
+    auto_close_prompts = guild_state.setdefault("auto_close_prompts", {})
 
     thread_key = str(thread.id)
     if thread_key in report_results:
@@ -598,7 +1012,21 @@ async def resolve_report(
                 current_rep = 0
             user_record["rep"] = current_rep + 1
 
+    if isinstance(reporter_discord_id, int):
+        reporter_record = get_user_memory_record(guild_state, reporter_discord_id)
+        if won_fight:
+            current_wins = reporter_record.get("wins", 0)
+            if not isinstance(current_wins, int):
+                current_wins = 0
+            reporter_record["wins"] = current_wins + 1
+        else:
+            current_losses = reporter_record.get("losses", 0)
+            if not isinstance(current_losses, int):
+                current_losses = 0
+            reporter_record["losses"] = current_losses + 1
+
     report_results[thread_key] = "won" if won_fight else "lost"
+    auto_close_prompts.pop(thread_key, None)
     save_guild_config(bot.guild_config)
 
     await send_resolution_dms(
@@ -607,6 +1035,8 @@ async def resolve_report(
         ally_discord_ids,
         won_fight,
     )
+
+    await delete_report_notification(bot, thread)
 
     try:
         await thread.delete()
@@ -691,6 +1121,14 @@ class CreateReportModal(discord.ui.Modal, title="Create AT Report"):
             )
             return
 
+        notifications_channel_id = guild_config.get("report_channel_id")
+        if not isinstance(notifications_channel_id, int):
+            await interaction.response.send_message(
+                "No report channel is configured yet. Run `/setup` first.",
+                ephemeral=True,
+            )
+            return
+
         mention_role_id = guild_config.get("mention_role_id")
         if not isinstance(mention_role_id, int):
             await interaction.response.send_message(
@@ -724,6 +1162,16 @@ class CreateReportModal(discord.ui.Modal, title="Create AT Report"):
             await interaction.followup.send(str(error), ephemeral=True)
             return
 
+        guild_state = get_guild_state(bot, interaction.guild.id)
+        try:
+            ensure_user_link_available(guild_state, interaction.user.id, reporter)
+        except ValueError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+
+        set_saved_user_entry(guild_state, interaction.user.id, reporter)
+        save_guild_config(bot.guild_config)
+
         allies: list[RobloxUser] = []
         title = build_report_thread_title(reporter, allies, teamers)
         embeds = build_report_embeds(
@@ -734,25 +1182,25 @@ class CreateReportModal(discord.ui.Modal, title="Create AT Report"):
             teamers,
         )
         join_view = ReportActionView(reporter.join_url)
-        role_mention = f"<@&{mention_role_id}>"
+        reporter_mention = f"<@{interaction.user.id}>"
 
         try:
             if isinstance(forum_channel, discord.ForumChannel):
                 thread_with_message = await forum_channel.create_thread(
                     name=title,
-                    content=role_mention,
+                    content=reporter_mention,
                     embeds=embeds[:10],
                     view=join_view,
-                    allowed_mentions=discord.AllowedMentions(roles=True),
+                    allowed_mentions=discord.AllowedMentions(users=True),
                 )
                 target_name = thread_with_message.thread.mention
                 report_thread_id = thread_with_message.thread.id
             else:
                 await forum_channel.send(
-                    content=role_mention,
+                    content=reporter_mention,
                     embeds=embeds[:10],
                     view=join_view,
-                    allowed_mentions=discord.AllowedMentions(roles=True),
+                    allowed_mentions=discord.AllowedMentions(users=True),
                 )
                 target_name = forum_channel.mention
                 report_thread_id = None
@@ -772,6 +1220,16 @@ class CreateReportModal(discord.ui.Modal, title="Create AT Report"):
             guild_state.setdefault("ally_user_ids", {})[str(report_thread_id)] = []
             guild_state.setdefault("ally_usernames", {})[str(report_thread_id)] = []
             save_guild_config(bot.guild_config)
+            thread = await get_thread_by_id(interaction.guild, report_thread_id)
+            if thread is not None:
+                await announce_report_notification(
+                    bot,
+                    thread,
+                    interaction.user.id,
+                    mention_role_id,
+                    notifications_channel_id,
+                    build_report_count_title(allies, teamers),
+                )
 
         await interaction.followup.send(
             embed=discord.Embed(
@@ -814,6 +1272,28 @@ class CreateReportView(discord.ui.View):
             return
 
         guild_state = get_guild_state(bot_client, interaction.guild.id)
+        mention_role_id = guild_state.get("mention_role_id")
+        if not isinstance(interaction.user, discord.Member):
+            await interaction.response.send_message(
+                "This can only be used inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        if not isinstance(mention_role_id, int):
+            await interaction.response.send_message(
+                "No report role is configured yet. Run `/setup` first.",
+                ephemeral=True,
+            )
+            return
+
+        if mention_role_id not in {role.id for role in interaction.user.roles}:
+            await interaction.response.send_message(
+                "You must have the configured anti-teaming role to create a report.",
+                ephemeral=True,
+            )
+            return
+
         saved_user = get_saved_user_entry(guild_state, interaction.user.id)
         await interaction.response.send_modal(CreateReportModal(saved_user))
 
@@ -969,6 +1449,7 @@ class AddYourselfModal(discord.ui.Modal, title="Add Yourself"):
 
         try:
             resolved_user = await bot_client.roblox.resolve_user(raw_player)
+            ensure_user_link_available(guild_state, interaction.user.id, resolved_user)
             set_saved_user_entry(guild_state, interaction.user.id, resolved_user)
             save_guild_config(bot_client.guild_config)
             _, _, _, added_allies = await append_allies_to_report(
@@ -977,6 +1458,7 @@ class AddYourselfModal(discord.ui.Modal, title="Add Yourself"):
                 [resolved_user.profile_url],
                 interaction.user.id,
             )
+            await post_helper_join_message(interaction.channel, interaction.user.id)
         except (RobloxAPIError, ValueError, discord.NotFound) as error:
             await interaction.followup.send(str(error), ephemeral=True)
             return
@@ -1062,6 +1544,7 @@ class AddYourselfButton(discord.ui.Button["ReportActionView"]):
                 [remembered_user["value"]],
                 interaction.user.id,
             )
+            await post_helper_join_message(interaction.channel, interaction.user.id)
         except (RobloxAPIError, ValueError, discord.NotFound) as error:
             await interaction.followup.send(str(error), ephemeral=True)
             return
@@ -1082,13 +1565,358 @@ class AddYourselfButton(discord.ui.Button["ReportActionView"]):
         )
 
 
+async def post_helper_join_message(
+    thread: discord.Thread,
+    helper_discord_id: int,
+) -> None:
+    await thread.send(
+        content=f"<@{helper_discord_id}> has joined to help! {thread.mention}",
+        allowed_mentions=discord.AllowedMentions(users=True),
+    )
+
+
+class JoinNotificationModal(discord.ui.Modal, title="Join Report"):
+    def __init__(self, thread_id: int) -> None:
+        super().__init__()
+        self.thread_id = thread_id
+        self.username = discord.ui.TextInput(
+            label="Your username or profile url",
+            placeholder="Username or Roblox profile URL",
+            max_length=200,
+        )
+        self.add_item(self.username)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This can only be used inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        bot_client = interaction.client
+        if not isinstance(bot_client, ATBot):
+            await interaction.response.send_message(
+                "The bot client is not ready yet.",
+                ephemeral=True,
+            )
+            return
+
+        thread = await get_thread_by_id(interaction.guild, self.thread_id)
+        if thread is None:
+            await interaction.response.send_message(
+                "I could not find the report thread for this notification.",
+                ephemeral=True,
+            )
+            return
+
+        guild_state = get_guild_state(bot_client, interaction.guild.id)
+        reporter_ids = guild_state["reporter_ids"]
+        if reporter_ids.get(str(thread.id)) == interaction.user.id:
+            await interaction.response.send_message(
+                "The reporter cannot use Join on their own report.",
+                ephemeral=True,
+            )
+            return
+
+        raw_player = self.username.value.strip()
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            resolved_user = await bot_client.roblox.resolve_user(raw_player)
+            ensure_user_link_available(guild_state, interaction.user.id, resolved_user)
+            set_saved_user_entry(guild_state, interaction.user.id, resolved_user)
+            save_guild_config(bot_client.guild_config)
+            _, _, _, added_allies = await append_allies_to_report(
+                bot_client,
+                thread,
+                [resolved_user.profile_url],
+                interaction.user.id,
+            )
+            await post_helper_join_message(thread, interaction.user.id)
+        except (RobloxAPIError, ValueError, discord.NotFound) as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I do not have permission to edit this report.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="Joined squad",
+                description=f"You joined {thread.mention}.",
+                color=ALLY_EMBED_COLOR,
+            ),
+            ephemeral=True,
+        )
+
+
+class NotificationJoinButton(discord.ui.Button["NotificationActionView"]):
+    def __init__(self) -> None:
+        super().__init__(
+            label="Join",
+            style=discord.ButtonStyle.success,
+            custom_id="report:joinnotification",
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This can only be used inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        bot_client = interaction.client
+        if not isinstance(bot_client, ATBot):
+            await interaction.response.send_message(
+                "The bot client is not ready yet.",
+                ephemeral=True,
+            )
+            return
+
+        guild_state = get_guild_state(bot_client, interaction.guild.id)
+        thread_id = extract_thread_id_from_notification_message(
+            guild_state,
+            interaction.message,
+        )
+        if thread_id is None:
+            await interaction.response.send_message(
+                "I could not find the report thread for this notification.",
+                ephemeral=True,
+            )
+            return
+
+        thread = await get_thread_by_id(interaction.guild, thread_id)
+        if thread is None:
+            await interaction.response.send_message(
+                "I could not find the report thread for this notification.",
+                ephemeral=True,
+            )
+            return
+
+        reporter_ids = guild_state["reporter_ids"]
+        if reporter_ids.get(str(thread.id)) == interaction.user.id:
+            await interaction.response.send_message(
+                "The reporter cannot use Join on their own report.",
+                ephemeral=True,
+            )
+            return
+
+        remembered_user = get_saved_user_entry(guild_state, interaction.user.id)
+        if not remembered_user:
+            await interaction.response.send_modal(JoinNotificationModal(thread.id))
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        try:
+            _, _, _, added_allies = await append_allies_to_report(
+                bot_client,
+                thread,
+                [remembered_user["value"]],
+                interaction.user.id,
+            )
+            await post_helper_join_message(thread, interaction.user.id)
+        except (RobloxAPIError, ValueError, discord.NotFound) as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "I do not have permission to edit this report.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            embed=discord.Embed(
+                title="Joined squad",
+                description=f"You joined {thread.mention}.",
+                color=ALLY_EMBED_COLOR,
+            ),
+            ephemeral=True,
+        )
+
+
+class NotificationActionView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+        self.add_item(NotificationJoinButton())
+
+
+class AutoCloseOutcomeView(discord.ui.View):
+    def __init__(self, guild_id: int, thread_id: int, reporter_discord_id: int) -> None:
+        super().__init__(timeout=600)
+        self.guild_id = guild_id
+        self.thread_id = thread_id
+        self.reporter_discord_id = reporter_discord_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.reporter_discord_id:
+            return True
+        await interaction.response.send_message(
+            "Only the reporter can answer this.",
+            ephemeral=True,
+        )
+        return False
+
+    async def finish_outcome(
+        self,
+        interaction: discord.Interaction,
+        won_fight: bool,
+    ) -> None:
+        bot_client = interaction.client
+        if not isinstance(bot_client, ATBot):
+            await interaction.response.send_message(
+                "The bot client is not ready yet.",
+                ephemeral=True,
+            )
+            return
+
+        guild = bot_client.get_guild(self.guild_id)
+        if guild is None:
+            await interaction.response.send_message(
+                "I could not find the server for this report.",
+                ephemeral=True,
+            )
+            return
+
+        thread = await get_thread_by_id(guild, self.thread_id)
+        if thread is None:
+            await interaction.response.send_message(
+                "I could not find the report thread anymore.",
+                ephemeral=True,
+            )
+            return
+
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.response.edit_message(
+            content="Thanks. The report outcome has been recorded.",
+            view=self,
+        )
+        await resolve_report(bot_client, thread, won_fight)
+
+    @discord.ui.button(label="Won", style=discord.ButtonStyle.success)
+    async def won_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self.finish_outcome(interaction, True)
+
+    @discord.ui.button(label="Lost", style=discord.ButtonStyle.danger)
+    async def lost_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await self.finish_outcome(interaction, False)
+
+
+class AutoClosePromptView(discord.ui.View):
+    def __init__(self, guild_id: int, thread_id: int, reporter_discord_id: int) -> None:
+        super().__init__(timeout=AUTO_CLOSE_RESPONSE_SECONDS)
+        self.guild_id = guild_id
+        self.thread_id = thread_id
+        self.reporter_discord_id = reporter_discord_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.reporter_discord_id:
+            return True
+        await interaction.response.send_message(
+            "Only the reporter can answer this.",
+            ephemeral=True,
+        )
+        return False
+
+    async def clear_prompt(self, bot: "ATBot") -> None:
+        guild_state = get_guild_state(bot, self.guild_id)
+        guild_state.setdefault("auto_close_prompts", {}).pop(str(self.thread_id), None)
+        save_guild_config(bot.guild_config)
+
+    @discord.ui.button(label="Yes", style=discord.ButtonStyle.success)
+    async def yes_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        bot_client = interaction.client
+        if not isinstance(bot_client, ATBot):
+            await interaction.response.send_message(
+                "The bot client is not ready yet.",
+                ephemeral=True,
+            )
+            return
+
+        await self.clear_prompt(bot_client)
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.response.edit_message(
+            content="Did you win the fight?",
+            view=AutoCloseOutcomeView(
+                self.guild_id,
+                self.thread_id,
+                self.reporter_discord_id,
+            ),
+        )
+
+    @discord.ui.button(label="No", style=discord.ButtonStyle.danger)
+    async def no_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        bot_client = interaction.client
+        if not isinstance(bot_client, ATBot):
+            await interaction.response.send_message(
+                "The bot client is not ready yet.",
+                ephemeral=True,
+            )
+            return
+
+        guild = bot_client.get_guild(self.guild_id)
+        if guild is None:
+            await interaction.response.send_message(
+                "I could not find the server for this report.",
+                ephemeral=True,
+            )
+            return
+
+        thread = await get_thread_by_id(guild, self.thread_id)
+        if thread is None:
+            await interaction.response.send_message(
+                "I could not find the report thread anymore.",
+                ephemeral=True,
+            )
+            return
+
+        await self.clear_prompt(bot_client)
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.response.edit_message(
+            content="Got it. The report was bumped again.",
+            view=self,
+        )
+        await bump_report_notification(bot_client, thread)
+
+
 class CloseDecisionView(discord.ui.View):
     def __init__(self, reporter_discord_id: int) -> None:
         super().__init__(timeout=600)
         self.reporter_discord_id = reporter_discord_id
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.reporter_discord_id:
+        if isinstance(interaction.user, discord.Member) and can_manage_report(
+            interaction.user,
+            self.reporter_discord_id,
+        ):
             return True
 
         await interaction.response.send_message(
@@ -1204,7 +2032,10 @@ class CloseReportButton(discord.ui.Button["ReportActionView"]):
             )
             return
 
-        if reporter_discord_id != interaction.user.id:
+        if not isinstance(interaction.user, discord.Member) or not can_manage_report(
+            interaction.user,
+            reporter_discord_id if isinstance(reporter_discord_id, int) else -1,
+        ):
             await interaction.response.send_message(
                 "Only the reporter can close this report.",
                 ephemeral=True,
@@ -1254,19 +2085,110 @@ class ATBot(commands.Bot):
         self.http_session: aiohttp.ClientSession | None = None
         self.roblox: RobloxClient
         self.guild_config = load_guild_config()
+        self.status_index = 0
 
     async def setup_hook(self) -> None:
         self.http_session = aiohttp.ClientSession()
         self.roblox = RobloxClient(self.http_session)
         self.add_view(CreateReportView())
         self.add_view(ReportActionView("https://www.roblox.com"))
+        self.add_view(NotificationActionView())
         synced = await self.tree.sync()
-        logger.info("Synced %s application command(s).", len(synced))
+        logger.info(
+            "Synced %s application command(s) globally. Test mode: %s. Memory file: %s",
+            len(synced),
+            TEST_MODE,
+            CONFIG_PATH,
+        )
+        if not self.rotate_status.is_running():
+            self.rotate_status.start()
+        if TEST_MODE and not self.monitor_reports.is_running():
+            self.monitor_reports.start()
 
     async def close(self) -> None:
+        if self.rotate_status.is_running():
+            self.rotate_status.cancel()
+        if self.monitor_reports.is_running():
+            self.monitor_reports.cancel()
         if self.http_session is not None and not self.http_session.closed:
             await self.http_session.close()
         await super().close()
+
+    @tasks.loop(seconds=5)
+    async def rotate_status(self) -> None:
+        if self.user is None:
+            return
+
+        status_messages = compute_status_messages(self.guild_config)
+        if not status_messages:
+            return
+
+        message = status_messages[self.status_index % len(status_messages)]
+        self.status_index += 1
+        await self.change_presence(activity=discord.Game(name=message))
+
+    @rotate_status.before_loop
+    async def before_rotate_status(self) -> None:
+        await self.wait_until_ready()
+
+    @tasks.loop(seconds=15)
+    async def monitor_reports(self) -> None:
+        now = time.time()
+
+        for guild in self.guilds:
+            guild_state = get_guild_state(self, guild.id)
+            reporter_ids = guild_state["reporter_ids"]
+            report_results = guild_state["report_results"]
+            auto_close_prompts = guild_state.setdefault("auto_close_prompts", {})
+
+            for thread_id_text, reporter_discord_id in list(reporter_ids.items()):
+                if not thread_id_text.isdigit():
+                    continue
+
+                thread_id = int(thread_id_text)
+                if thread_id_text in report_results:
+                    auto_close_prompts.pop(thread_id_text, None)
+                    continue
+
+                thread = await get_thread_by_id(guild, thread_id)
+                if thread is None:
+                    continue
+
+                age_seconds = (discord.utils.utcnow() - thread.created_at).total_seconds()
+                prompt_entry = auto_close_prompts.get(thread_id_text)
+
+                if prompt_entry is None:
+                    if age_seconds >= AUTO_CLOSE_TRIGGER_SECONDS and isinstance(
+                        reporter_discord_id, int
+                    ):
+                        await send_reporter_prompt(self, thread)
+                    continue
+
+                expires_at = prompt_entry.get("expires_at")
+                if isinstance(expires_at, (int, float)) and now >= expires_at:
+                    auto_close_prompts.pop(thread_id_text, None)
+                    save_guild_config(self.guild_config)
+
+                    if isinstance(reporter_discord_id, int):
+                        member = guild.get_member(reporter_discord_id)
+                        if member is None:
+                            try:
+                                member = await guild.fetch_member(reporter_discord_id)
+                            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                                member = None
+                        if member is not None:
+                            try:
+                                await member.send(
+                                    "You did not respond in time, so the report was closed as a loss and deleted."
+                                )
+                            except discord.Forbidden:
+                                pass
+
+                    await resolve_report(self, thread, False)
+
+    @monitor_reports.before_loop
+    async def before_monitor_reports(self) -> None:
+        await self.wait_until_ready()
 
 
 bot = ATBot()
@@ -1302,8 +2224,9 @@ async def setup(
         )
         return
 
-    if not isinstance(interaction.user, discord.Member) or not has_setup_permissions(
-        interaction.user
+    if not isinstance(interaction.user, discord.Member) or (
+        not has_setup_permissions(interaction.user)
+        and not has_staff_override(interaction.user)
     ):
         await interaction.response.send_message(
             "You do not have permission to use `/setup`.",
@@ -1319,15 +2242,19 @@ async def setup(
         )
         return
 
-    bot_client.guild_config[str(interaction.guild.id)] = {
-        "report_channel_id": report_channel.id,
-        "forum_channel_id": forum_channel.id,
-        "mention_role_id": role.id,
-    }
+    guild_state = get_guild_state(bot_client, interaction.guild.id)
+    guild_state["report_channel_id"] = report_channel.id
+    guild_state["forum_channel_id"] = forum_channel.id
+    guild_state["mention_role_id"] = role.id
     save_guild_config(bot_client.guild_config)
 
     await report_channel.send(
-        embed=build_panel_embed(forum_channel.mention),
+        embeds=[
+            build_panel_embed(forum_channel.mention),
+            build_panel_commands_embed(),
+            build_panel_image_embed(),
+        ],
+        file=discord.File("ATpfp.png", filename="ATpfp.png"),
         view=CreateReportView(),
     )
 
@@ -1337,6 +2264,7 @@ async def setup(
             description=(
                 f"The AT report panel has been posted in {report_channel.mention}.\n"
                 f"Reports will point people to {forum_channel.mention}.\n"
+                f"Anti-teaming notifications will also post in {report_channel.mention}.\n"
                 f"Each report will mention {role.mention}."
             ),
             color=EMBED_COLOR,
@@ -1380,6 +2308,12 @@ async def setuser(
         return
 
     guild_state = get_guild_state(bot_client, interaction.guild.id)
+    try:
+        ensure_user_link_available(guild_state, interaction.user.id, roblox_user)
+    except ValueError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+
     set_saved_user_entry(guild_state, interaction.user.id, roblox_user)
     save_guild_config(bot_client.guild_config)
 
@@ -1439,6 +2373,202 @@ async def removerep_autocomplete(
     return results
 
 
+async def resolve_member_display_name(
+    guild: discord.Guild,
+    discord_user_id: int,
+) -> str:
+    member = guild.get_member(discord_user_id)
+    if member is not None:
+        return member.display_name
+
+    try:
+        member = await guild.fetch_member(discord_user_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return f"Unknown User ({discord_user_id})"
+
+    return member.display_name
+
+
+async def resolve_member_avatar_url(
+    guild: discord.Guild,
+    discord_user_id: int,
+) -> str | None:
+    member = guild.get_member(discord_user_id)
+    if member is not None:
+        return member.display_avatar.url
+
+    try:
+        member = await guild.fetch_member(discord_user_id)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return None
+
+    return member.display_avatar.url
+
+
+@bot.tree.command(
+    name="leaderboard",
+    description="Show the helper leaderboard for this server.",
+)
+async def leaderboard(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    bot_client = interaction.client
+    if not isinstance(bot_client, ATBot):
+        await interaction.response.send_message(
+            "The bot client is not ready yet.",
+            ephemeral=True,
+        )
+        return
+
+    guild_state = get_guild_state(bot_client, interaction.guild.id)
+    user_memory = guild_state.get("user_memory", {})
+    if not isinstance(user_memory, dict):
+        user_memory = {}
+
+    ranked_entries: list[tuple[int, int, str]] = []
+    for discord_user_id, entry in user_memory.items():
+        if not isinstance(entry, dict):
+            continue
+
+        rep = entry.get("rep", 0)
+        roblox_username = entry.get("username")
+        if not isinstance(rep, int) or rep < 1 or not isinstance(roblox_username, str):
+            continue
+
+        try:
+            ranked_entries.append((int(discord_user_id), rep, roblox_username))
+        except ValueError:
+            continue
+
+    ranked_entries.sort(key=lambda item: (-item[1], item[2].lower()))
+
+    if not ranked_entries:
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="Helper Leaderboard",
+                description="No helpers with 1+ rep yet.",
+                color=EMBED_COLOR,
+            ),
+            ephemeral=False,
+        )
+        return
+
+    lines: list[str] = []
+    for discord_user_id, rep, roblox_username in ranked_entries:
+        display_name = await resolve_member_display_name(
+            interaction.guild,
+            discord_user_id,
+        )
+        lines.append(f"{display_name} ({roblox_username}) - `{rep}` rep")
+
+    description = "\n".join(lines)
+    if len(description) > 4096:
+        trimmed_lines: list[str] = []
+        current_length = 0
+        for line in lines:
+            extra_length = len(line) + (1 if trimmed_lines else 0)
+            if current_length + extra_length > 4096:
+                break
+            trimmed_lines.append(line)
+            current_length += extra_length
+        description = "\n".join(trimmed_lines)
+
+    leaderboard_embed = discord.Embed(
+        title="Helper Leaderboard",
+        description=description,
+        color=EMBED_COLOR,
+    )
+
+    first_place_discord_user_id = ranked_entries[0][0]
+    first_place_avatar_url = await resolve_member_avatar_url(
+        interaction.guild,
+        first_place_discord_user_id,
+    )
+    if first_place_avatar_url:
+        leaderboard_embed.set_thumbnail(url=first_place_avatar_url)
+
+    await interaction.response.send_message(
+        embed=leaderboard_embed,
+        ephemeral=False,
+    )
+
+
+@bot.tree.command(
+    name="bumb",
+    description="Re-ping the helper role for the current report after 30 minutes.",
+)
+async def bumb(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return
+
+    bot_client = interaction.client
+    if not isinstance(bot_client, ATBot):
+        await interaction.response.send_message(
+            "The bot client is not ready yet.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(interaction.channel, discord.Thread):
+        await interaction.response.send_message(
+            "Run this command inside the report thread.",
+            ephemeral=True,
+        )
+        return
+
+    guild_state = get_guild_state(bot_client, interaction.guild.id)
+    reporter_discord_id = guild_state["reporter_ids"].get(str(interaction.channel.id))
+    if not isinstance(interaction.user, discord.Member) or not can_manage_report(
+        interaction.user,
+        reporter_discord_id if isinstance(reporter_discord_id, int) else -1,
+    ):
+        await interaction.response.send_message(
+            "Only the reporter can use this command.",
+            ephemeral=True,
+        )
+        return
+
+    age_seconds = (discord.utils.utcnow() - interaction.channel.created_at).total_seconds()
+    if age_seconds < 1800:
+        await interaction.response.send_message(
+            "You can only use `/bumb` 30 minutes into the fight.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        await bump_report_notification(bot_client, interaction.channel)
+    except ValueError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "I do not have permission to bump this report.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        embed=discord.Embed(
+            title="Report bumped",
+            description="A new helper notification was posted.",
+            color=EMBED_COLOR,
+        ),
+        ephemeral=True,
+    )
+
+
 @app_commands.autocomplete(player=removerep_autocomplete)
 @bot.tree.command(
     name="removerep",
@@ -1475,7 +2605,10 @@ async def removerep(
 
     guild_state = get_guild_state(bot_client, interaction.guild.id)
     reporter_discord_id = guild_state["reporter_ids"].get(str(interaction.channel.id))
-    if reporter_discord_id != interaction.user.id:
+    if reporter_discord_id != interaction.user.id and (
+        not isinstance(interaction.user, discord.Member)
+        or not has_staff_override(interaction.user)
+    ):
         await interaction.response.send_message(
             "Only the reporter can use this command.",
             ephemeral=True,
@@ -1512,9 +2645,10 @@ async def removerep(
 
 
 def main() -> None:
-    token = os.getenv("DISCORD_TOKEN")
+    token_name = "TEST_DISCORD_TOKEN" if TEST_MODE else "DISCORD_TOKEN"
+    token = os.getenv(token_name)
     if not token:
-        raise RuntimeError("DISCORD_TOKEN is missing from the .env file.")
+        raise RuntimeError(f"{token_name} is missing from the .env file.")
 
     bot.run(token)
 
