@@ -56,6 +56,7 @@ def load_guild_config() -> dict[str, dict[str, Any]]:
 
             guild_state.setdefault("reporter_ids", {})
             guild_state.setdefault("reporter_usernames", {})
+            guild_state.setdefault("report_regions", {})
             guild_state.setdefault("report_results", {})
             guild_state.setdefault("report_notification_messages", {})
             guild_state.setdefault("auto_close_prompts", {})
@@ -87,6 +88,7 @@ def get_guild_state(bot: "ATBot", guild_id: int) -> dict[str, Any]:
     state = bot.guild_config.setdefault(str(guild_id), {})
     state.setdefault("reporter_ids", {})
     state.setdefault("reporter_usernames", {})
+    state.setdefault("report_regions", {})
     state.setdefault("report_results", {})
     state.setdefault("report_notification_messages", {})
     state.setdefault("auto_close_prompts", {})
@@ -302,15 +304,23 @@ def build_report_thread_title(
     reporter: RobloxUser,
     allies: list[RobloxUser],
     teamers: list[RobloxUser],
+    region: str | None = None,
 ) -> str:
-    return f"{1 + len(allies)}v{len(teamers)} from {reporter.display_name}"[:100]
+    title = f"{1 + len(allies)}v{len(teamers)} from {reporter.display_name}"
+    if region:
+        title = f"{title} in {region}"
+    return title[:100]
 
 
 def build_report_count_title(
     allies: list[RobloxUser],
     teamers: list[RobloxUser],
+    region: str | None = None,
 ) -> str:
-    return f"{1 + len(allies)}v{len(teamers)}"
+    title = f"{1 + len(allies)}v{len(teamers)}"
+    if region:
+        title = f"{title} in {region}"
+    return title
 
 
 def build_report_notification_embed(
@@ -371,7 +381,7 @@ def compute_status_messages(config: dict[str, dict[str, Any]]) -> list[str]:
                 total_wins += wins
             if isinstance(losses, int):
                 total_losses += losses
-            if isinstance(rep, int) and rep > 1:
+            if isinstance(rep, int) and rep >= 1:
                 active_helpers += 1
 
     total_fights = total_wins + total_losses
@@ -425,6 +435,25 @@ def get_report_identity(
         )
         ally_discord_usernames.append(member.name if member else None)
     return reporter_discord_username, ally_discord_ids, ally_discord_usernames
+
+
+def get_report_region(guild_state: dict[str, Any], thread_id: int) -> str | None:
+    report_regions = guild_state.setdefault("report_regions", {})
+    region = report_regions.get(str(thread_id))
+    return region if isinstance(region, str) and region else None
+
+
+def has_open_report(guild_state: dict[str, Any], discord_user_id: int) -> bool:
+    reporter_ids = guild_state.get("reporter_ids", {})
+    report_results = guild_state.get("report_results", {})
+    if not isinstance(reporter_ids, dict) or not isinstance(report_results, dict):
+        return False
+
+    for thread_id, reporter_id in reporter_ids.items():
+        if reporter_id == discord_user_id and thread_id not in report_results:
+            return True
+
+    return False
 
 
 def has_setup_permissions(member: discord.Member) -> bool:
@@ -626,7 +655,8 @@ async def bump_report_notification(
 
     report_message = await get_report_message(thread)
     reporter, allies, teamers = await parse_report_message(bot, report_message)
-    count_title = build_report_count_title(allies, teamers)
+    guild_state = get_guild_state(bot, thread.guild.id)
+    region = get_report_region(guild_state, thread.id)
 
     await delete_report_notification(bot, thread)
     await announce_report_notification(
@@ -635,7 +665,7 @@ async def bump_report_notification(
         reporter_discord_id,
         mention_role_id,
         report_channel_id,
-        count_title,
+        build_report_count_title(allies, teamers, region),
     )
 
 
@@ -675,6 +705,7 @@ async def append_teamers_to_report(
     report_message = await get_report_message(thread)
     reporter, allies, existing_teamers = await parse_report_message(bot, report_message)
     guild_state = get_guild_state(bot, thread.guild.id)
+    region = get_report_region(guild_state, thread.id)
     reporter_discord_username, ally_discord_ids, ally_discord_usernames = (
         get_report_identity(thread.guild, guild_state, thread.id)
     )
@@ -706,12 +737,12 @@ async def append_teamers_to_report(
         embeds=updated_embeds[:10],
         view=ReportActionView(reporter.join_url),
     )
-    new_title = build_report_thread_title(reporter, allies, existing_teamers)
+    new_title = build_report_thread_title(reporter, allies, existing_teamers, region)
     await thread.edit(name=new_title)
     await sync_report_notification(
         bot,
         thread,
-        build_report_count_title(allies, existing_teamers),
+        build_report_count_title(allies, existing_teamers, region),
     )
 
     return reporter, allies, existing_teamers, added_teamers
@@ -726,6 +757,7 @@ async def append_allies_to_report(
     report_message = await get_report_message(thread)
     reporter, existing_allies, teamers = await parse_report_message(bot, report_message)
     guild_state = get_guild_state(bot, thread.guild.id)
+    region = get_report_region(guild_state, thread.id)
     ally_user_ids_map = guild_state.setdefault("ally_user_ids", {})
     ally_discord_ids = ally_user_ids_map.setdefault(str(thread.id), [])
     ally_usernames_map = guild_state.setdefault("ally_usernames", {})
@@ -784,12 +816,12 @@ async def append_allies_to_report(
         embeds=updated_embeds[:10],
         view=ReportActionView(reporter.join_url),
     )
-    new_title = build_report_thread_title(reporter, existing_allies, teamers)
+    new_title = build_report_thread_title(reporter, existing_allies, teamers, region)
     await thread.edit(name=new_title)
     await sync_report_notification(
         bot,
         thread,
-        build_report_count_title(existing_allies, teamers),
+        build_report_count_title(existing_allies, teamers, region),
     )
 
     return reporter, existing_allies, teamers, added_allies
@@ -804,6 +836,7 @@ async def remove_ally_from_report(
     report_message = await get_report_message(thread)
     reporter, existing_allies, teamers = await parse_report_message(bot, report_message)
     guild_state = get_guild_state(bot, thread.guild.id)
+    region = get_report_region(guild_state, thread.id)
     reporter_discord_username, ally_discord_ids, ally_discord_usernames = (
         get_report_identity(thread.guild, guild_state, thread.id)
     )
@@ -850,12 +883,12 @@ async def remove_ally_from_report(
         embeds=updated_embeds[:10],
         view=ReportActionView(reporter.join_url),
     )
-    new_title = build_report_thread_title(reporter, existing_allies, teamers)
+    new_title = build_report_thread_title(reporter, existing_allies, teamers, region)
     await thread.edit(name=new_title)
     await sync_report_notification(
         bot,
         thread,
-        build_report_count_title(existing_allies, teamers),
+        build_report_count_title(existing_allies, teamers, region),
     )
 
     member = thread.guild.get_member(ally_discord_id)
@@ -1045,8 +1078,9 @@ async def resolve_report(
 
 
 class CreateReportModal(discord.ui.Modal, title="Create AT Report"):
-    def __init__(self, saved_user: dict[str, str] | None = None) -> None:
+    def __init__(self, region: str, saved_user: dict[str, str] | None = None) -> None:
         super().__init__()
+        self.region = region
         self.saved_user = saved_user
 
         if saved_user is None:
@@ -1077,7 +1111,7 @@ class CreateReportModal(discord.ui.Modal, title="Create AT Report"):
             max_length=200,
         )
         self.addteamer_note = discord.ui.TextDisplay(
-            "You can add more teamers in the post."
+            f"Region: `{region}`\nYou can add more teamers in the post."
         )
 
         if self.reporter is not None:
@@ -1149,6 +1183,7 @@ class CreateReportModal(discord.ui.Modal, title="Create AT Report"):
         optional_teamer = self.teamer_three.value.strip()
         if optional_teamer:
             player_entries.append(optional_teamer)
+        region = self.region
 
         await interaction.response.defer(ephemeral=True, thinking=True)
 
@@ -1173,7 +1208,7 @@ class CreateReportModal(discord.ui.Modal, title="Create AT Report"):
         save_guild_config(bot.guild_config)
 
         allies: list[RobloxUser] = []
-        title = build_report_thread_title(reporter, allies, teamers)
+        title = build_report_thread_title(reporter, allies, teamers, region)
         embeds = build_report_embeds(
             reporter,
             interaction.user.name,
@@ -1217,6 +1252,7 @@ class CreateReportModal(discord.ui.Modal, title="Create AT Report"):
             guild_state.setdefault("reporter_usernames", {})[str(report_thread_id)] = (
                 interaction.user.name
             )
+            guild_state.setdefault("report_regions", {})[str(report_thread_id)] = region
             guild_state.setdefault("ally_user_ids", {})[str(report_thread_id)] = []
             guild_state.setdefault("ally_usernames", {})[str(report_thread_id)] = []
             save_guild_config(bot.guild_config)
@@ -1228,7 +1264,7 @@ class CreateReportModal(discord.ui.Modal, title="Create AT Report"):
                     interaction.user.id,
                     mention_role_id,
                     notifications_channel_id,
-                    build_report_count_title(allies, teamers),
+                    build_report_count_title(allies, teamers, region),
                 )
 
         await interaction.followup.send(
@@ -1272,30 +1308,58 @@ class CreateReportView(discord.ui.View):
             return
 
         guild_state = get_guild_state(bot_client, interaction.guild.id)
-        mention_role_id = guild_state.get("mention_role_id")
-        if not isinstance(interaction.user, discord.Member):
+        if has_open_report(guild_state, interaction.user.id):
             await interaction.response.send_message(
-                "This can only be used inside a server.",
-                ephemeral=True,
-            )
-            return
-
-        if not isinstance(mention_role_id, int):
-            await interaction.response.send_message(
-                "No report role is configured yet. Run `/setup` first.",
-                ephemeral=True,
-            )
-            return
-
-        if mention_role_id not in {role.id for role in interaction.user.roles}:
-            await interaction.response.send_message(
-                "You must have the configured anti-teaming role to create a report.",
+                "You already have an open report. Please close your current report before creating another one.",
                 ephemeral=True,
             )
             return
 
         saved_user = get_saved_user_entry(guild_state, interaction.user.id)
-        await interaction.response.send_modal(CreateReportModal(saved_user))
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title="Select Region",
+                description="Choose the region for this report.",
+                color=EMBED_COLOR,
+            ),
+            view=RegionSelectView(saved_user),
+            ephemeral=True,
+        )
+
+
+class RegionSelect(discord.ui.Select["RegionSelectView"]):
+    def __init__(self) -> None:
+        super().__init__(
+            placeholder="Select your region",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="NA East", value="NA East"),
+                discord.SelectOption(label="NA Central", value="NA Central"),
+                discord.SelectOption(label="NA West", value="NA West"),
+                discord.SelectOption(label="Asia", value="Asia"),
+                discord.SelectOption(label="Europe", value="Europe"),
+            ],
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not isinstance(self.view, RegionSelectView):
+            await interaction.response.send_message(
+                "This region selector is not ready.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(
+            CreateReportModal(self.values[0], self.view.saved_user)
+        )
+
+
+class RegionSelectView(discord.ui.View):
+    def __init__(self, saved_user: dict[str, str] | None) -> None:
+        super().__init__(timeout=120)
+        self.saved_user = saved_user
+        self.add_item(RegionSelect())
 
 
 class AddTeamerModal(discord.ui.Modal, title="Add Teamers"):
